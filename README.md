@@ -8,4 +8,4 @@ To run:
 4. Run the client program (make sure you have the server IP address and port number from step #3)
 5. Enter the file path as instructed on the client side
 
-And that's it! You successfully (and reliably-ish) transfered files between one machine to another (client to server). 
+And that's it! You successfully (and reliably-ish) transfered files between two machines. Swap client and server to send the other way. 
