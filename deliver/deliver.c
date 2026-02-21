@@ -9,6 +9,8 @@
 #include <libgen.h>
 #include <assert.h>
 #include <stdbool.h>
+#include <time.h>
+#include <errno.h>
 
 // Define packet struct
 typedef struct {
@@ -19,22 +21,22 @@ typedef struct {
     char filedata[1000];    // payload (packet-specific)
 } Packet;
 
-#define MESSAGE_SIZE 1100
+#define MESSAGE_SIZE 1100  // header + data < 1100 bytes (arbitrary but principled)
+#define RTT_MILLISECONDS 1.5 // round-trip time measured for test network
+#define FOS 2.0 // arbitrary but principled timeout Factor of Safety (Karn's Rule)
 
+// Prototypes
 long get_file_size_ftell(FILE *file);
 int read_bytes(FILE *file, char *buffer, int payload_size);
 int construct_message(Packet *pkt, char* msg);
 
 int main(int argc, char *argv[]) {
 
-    /**********************************LAB 1 ********************************************************************* */
-
     // Receive and parse user input
     if (argc != 3) {
         fprintf(stderr, "Usage: %s <server_address> <server_port_number>\n", argv[0]);
         return 1;
     }
-
     printf("Connecting to %s on port %s...\n", argv[1], argv[2]);
     const char *server_ip = argv[1];
     int server_port = atoi(argv[2]);
@@ -59,14 +61,23 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Initialize socket
+    // Initialize socket 
     int udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_socket < 0) {
         perror ("Sorry, couldn't create the socket");
         return 1;
     }
 
-    // Send a packet through the socket (and error check)
+    // Initialize timeout features in our socket
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = (RTT_MILLISECONDS * 1000.0) * FOS;
+    if (setsockopt(udp_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("setsockopt failed");
+        return 1;
+    }
+    
+    // Send a "handshake" packet through the socket (and error check)
     char *message = "ftp";
     if (sendto(udp_socket, message, strlen(message) + 1, 0, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("Failed to send message");
@@ -75,19 +86,17 @@ int main(int argc, char *argv[]) {
     }
     printf("Sent  \"%s\" to %s:%d\n", message, server_ip, server_port);
 
-    // Receive reply
+    // Receive and parse handshake reply
     char reply[64];
     int bytes_received = recvfrom(udp_socket, reply, sizeof(reply), 0, NULL, NULL);
-
     if (bytes_received < 0) {
         perror("Error receiving");
         close(udp_socket);
         return 1;
     }
-
     printf("Reply received...\n");
 
-    // Check if reply is "yes". If so, we are ready to start a file transfer!
+    // Check if reply is "yes". If so, handshake is complete and file transfer can begin!
     if (strcmp(reply, "yes") == 0) {
         printf("Reply was 'yes'. A file transfer can start.\n");
     } else {
@@ -95,10 +104,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /**********************************LAB 2 ********************************************************************* */
-    // For testing, we are using a large binary file at /tmp/test.file
-    // Later in Lab3, we implement timeouts for the stop-and-wait ACKs
-    // Hence may need fseek on server side
+    /********************************** FILE TRANSFER ********************************************************************* */
 
     // Re-usable file pointer (open file in read-binary mode)
     FILE *file_ptr = fopen(filepath, "rb");
@@ -119,9 +125,9 @@ int main(int argc, char *argv[]) {
     // Create a single packet that we will re-populate continuously!
     Packet packet;
 
-    // Prep 
+    // Initialize buffers, pointers, and logic for file transfer 
     long remaining_file_size = file_size;
-    char ftp_message_tx[MESSAGE_SIZE] = {0}; // (surely (data + header) < 1100 bytes)
+    char ftp_message_tx[MESSAGE_SIZE] = {0}; // (header + data comprise one message)
     char received_ack[100];
     bool successful_send = true;
 
@@ -130,24 +136,24 @@ int main(int argc, char *argv[]) {
         
         // Populate packet
         packet.total_frag = total_fragments;
-        packet.frag_no = i + 1; //naming starts from 1
+        packet.frag_no = i + 1; // naming starts from 1
         packet.filename = fname;
 
-        // last packet gets a different sizing
+        // Last packet gets a different sizing (file remnants)
         if (i != total_fragments - 1){
             packet.size = 1000;
         } else {
             packet.size = remaining_file_size;
         }
 
-        // reading info into each packet
+        // Obtain the payload of the packet from source file
         if (read_bytes(file_ptr, packet.filedata, packet.size) < 0){
             perror("Error reading file!");
             fclose(file_ptr);
             close(udp_socket);
             return -1;
         }
-        remaining_file_size -= packet.size;
+        remaining_file_size -= packet.size; // update file remnants
 
         // Construct message
         if (construct_message(&packet, ftp_message_tx) < 0){
@@ -157,9 +163,10 @@ int main(int argc, char *argv[]) {
             return -1;
         }
 
-        // Send packet and check ACK
+        // Send packet and check ACK against timeout
         successful_send = false;
         while (successful_send == false){
+
             // Send packet
             if (sendto(udp_socket, ftp_message_tx, MESSAGE_SIZE, 0, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
                 perror("Failed to send packet message");
@@ -168,20 +175,30 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
 
-            //TODO for lab3: this should block for limited time only (timeout)
-
-            // Move on only if ACK received, otherwise resend
+            // Move on only if ACK received, otherwise resend upon timeout
             bytes_received = recvfrom(udp_socket, received_ack, sizeof(received_ack), 0, NULL, NULL);
-            if (bytes_received < 0) {
-                perror("ACK not received");
-                close(udp_socket);
-                return 1;
+            if (bytes_received < 0){
+
+                // Timeout condition
+                if (errno == EAGAIN || errno == EWOULDBLOCK){
+                    printf("\nTimeout while attempting to send Packet #%d. Re-sending...\n", packet.frag_no);
+                    continue;
+                }
+
+                // Other error (fatal)
+                else {
+                    perror("Error receiving packets from server.");
+                    close(udp_socket);
+                    return 1;
+                }
             }
             
+            // Check the received ACK is correct (each msg has unique ACK)
             if ((unsigned int) atoi(received_ack) != packet.frag_no){
                 perror("ACK is for the wrong packet. Re-send.");
+                continue;
             } else {
-                successful_send = true;
+                successful_send = true; // all checks passed for this packet. Reliable transmission complete.
             }
         }
 
@@ -228,6 +245,7 @@ long get_file_size_ftell(FILE *file) {
 // Reading file to be transmitted
 int read_bytes(FILE *file, char *buffer, int payload_size){
 
+    // Standard file read
     int bytes_read = fread(buffer, 1, payload_size, file);  
     if (bytes_read != payload_size){
         perror("Error reading file!");
@@ -254,7 +272,7 @@ int construct_message(Packet *pkt, char* msg){
     memcpy(msg + header_len, pkt->filedata, pkt->size);
 
     // Sanity check that message size is equal to header + payload + colons
-    //assert(size of the message == header_len + pkt->size + 4);
+    //assert(size of the message == header + pkt->size + 4);
 
     return header_len + (int)pkt->size;
 }

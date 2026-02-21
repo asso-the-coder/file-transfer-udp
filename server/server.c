@@ -5,6 +5,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <time.h>
 
 // Define packet struct
 typedef struct {
@@ -15,20 +16,19 @@ typedef struct {
     char filedata[1000];    // payload (packet-specific)
 } Packet;
 
-#define MESSAGE_SIZE 1100
+#define MESSAGE_SIZE 1100 // header + data < 1100 bytes (arbitrary but principled)
+#define PACKET_LOSS_PERCENTAGE 10  // adjust this to test ARQ
 
+// Prototypes
 int parse_message(Packet *pkt, char* msg, char* filename_received);
 
 int main(int argc, char *argv[]) {
-
-    /**********************************LAB 1 ********************************************************************* */
 
     // Receive and parse user input
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <udp_listen_port>\n", argv[0]);
         return 1;
     }
-
     printf("Server running. UDP Listening on port %s...\n", argv[1]);
     const int my_port = atoi(argv[1]);
 
@@ -62,10 +62,9 @@ int main(int argc, char *argv[]) {
         close(udp_socket);
         return 1;
     }
-    
     printf("Message received from client: %s\n", message_rx);
 
-    // Check if message is "ftp"
+    // Check if message is "ftp" indicating a handshake request
     if (strcmp(message_rx, "ftp") != 0) {
         printf("Nothing shall be provided\n");
         close(udp_socket);
@@ -73,64 +72,36 @@ int main(int argc, char *argv[]) {
     }
     printf("Message matches 'ftp', attempting to send confirmation to client\n");
 
-    // Send a packet through the socket (to client address recorded earlier)
+    // Send a packet through the socket (to client address recorded earlier) to complete handshake
     char *message_tx = "yes";
     if (sendto(udp_socket, message_tx, strlen(message_tx) + 1, 0, (struct sockaddr *)&client_addr, sizeof(client_addr)) < 0) {
         perror("Failed to send message");
         close(udp_socket);
         return 1;
     }
+
+    // Handshake complete. File transfer can begin!
     printf("Sent \"%s\" back to client\n", message_tx);
 
-    /**********************************LAB 2 ********************************************************************* */
-    
-    // Receive the first packet
-    char ftp_message_rx[MESSAGE_SIZE];
-    bytes_received = recvfrom(udp_socket, ftp_message_rx, MESSAGE_SIZE, 0, (struct sockaddr*)&client_addr, &client_len);
-    if (bytes_received < 0) {
-        perror("Error receiving packet message from socket");
-        close(udp_socket);
-        return 1;
-    }
+    /********************************** FILE TRANSFER ********************************************************************* */
 
     // Create a single packet that we will re-populate continuously!
     Packet packet;
 
-    // Parse message and populate packet
+    // Initialize buffers and pointers for file transfer
+    char ftp_message_rx[MESSAGE_SIZE];
     char filename_received[100]; 
-    if (parse_message(&packet, ftp_message_rx, filename_received) < 0){
-        perror("Error parsing data!");
-        close(udp_socket);
-        return -1;
-    }
-    packet.filename = filename_received;
-
-    // Re-usable file pointer (open file in write-binary mode)
-    FILE *file_ptr = fopen(packet.filename, "wb");
-    if (!file_ptr){
-        perror("Could not open WRITE filestream");
-        return -1;
-    }
-
-    // Write to filestream
-    size_t written = fwrite(packet.filedata, 1, packet.size, file_ptr);
-    if (written != packet.size) {
-        perror("Error writing to filestream");
-        fclose(file_ptr);
-        return -1;
-    }
-
-    // Acknowledge (send back frag number)
     char ack_to_send[100];
-    snprintf(ack_to_send, sizeof(ack_to_send), "%d", packet.frag_no);
-    if (sendto(udp_socket, ack_to_send, strlen(ack_to_send) + 1, 0, (struct sockaddr *)&client_addr, sizeof(client_addr)) < 0) {
-        perror("Failed to send ACK");
-        close(udp_socket);
-        return 1;
-    }
+    size_t written = 0;
+    FILE *file_ptr = NULL;
+
+    // Random number generation (for packet loss testing)
+    srand(time(NULL));
+    int random_num = 0;
     
     // Enter loop until last fragment
-    for (unsigned int i = 1; i < packet.total_frag; i++){
+    unsigned int packets_received = 0;
+    while (packets_received < packet.total_frag){
 
         // Receive packet
         bytes_received = recvfrom(udp_socket, ftp_message_rx, MESSAGE_SIZE, 0, (struct sockaddr*)&client_addr, &client_len);
@@ -148,15 +119,23 @@ int main(int argc, char *argv[]) {
         }
         packet.filename = filename_received;
 
-        // Write to filestream
-        written = fwrite(packet.filedata, 1, packet.size, file_ptr);
-        if (written != packet.size) {
-            perror("Error writing to filestream");
-            fclose(file_ptr);
-            return -1;
+        // The very first packet is used to create the file
+        if (packets_received == 0){
+            file_ptr = fopen(packet.filename, "wb");
+            if (!file_ptr){
+                perror("Could not open WRITE filestream");
+                return -1;
+            }
+        }
+        
+        // Packet loss simulator (drop ACKs pseudo-randomly)
+        random_num = (rand() % 100); // between 0 and 99
+        if (random_num < PACKET_LOSS_PERCENTAGE){
+            printf("\nPacket #%d ACK intentionally dropped.", packets_received + 1);
+            continue;
         }
 
-        // Acknowledge
+        // Acknowledge uniquely (send back frag number)
         snprintf(ack_to_send, sizeof(ack_to_send), "%d", packet.frag_no);
         if (sendto(udp_socket, ack_to_send, strlen(ack_to_send) + 1, 0, (struct sockaddr *)&client_addr, sizeof(client_addr)) < 0) {
             perror("Failed to send ACK");
@@ -164,10 +143,21 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
+        // Write payload to filestream (IFF successfully received and ACK'd)
+        written = fwrite(packet.filedata, 1, packet.size, file_ptr);
+        if (written != packet.size) {
+            perror("Error writing to filestream");
+            fclose(file_ptr);
+            return -1;
+        }
+        
+        // Increment successfully received packets
+        packets_received++;
+
     }
 
     // Cleanups when done
-    printf("\nFile transfer complete. See %s in this directory.\n", packet.filename);
+    printf("\n\nFile transfer complete. Received %d packets. See %s in this directory.\n", packets_received, packet.filename);
     fclose(file_ptr);
     close(udp_socket);
 
@@ -176,7 +166,7 @@ int main(int argc, char *argv[]) {
 
 int parse_message(Packet *pkt, char* msg, char* filename_received){
 
-    // Traversal, placeholder, and colon-separator pointers
+    // Traversal pointer, placeholder buffer, and colon-separator location array
     char *msg_traversal_ptr = msg;
     char placeholder[MESSAGE_SIZE];
     unsigned int colon_positions[4] = {0};
@@ -194,6 +184,8 @@ int parse_message(Packet *pkt, char* msg, char* filename_received){
         }
         i++;
     }
+
+    /**  Using memset and memcpy everywhere for binary-safe data parsing **/
 
     // Traverse and parse the message using pointer math (accounting for colons!)
     memcpy(placeholder, msg_traversal_ptr, colon_positions[0]);
@@ -215,8 +207,9 @@ int parse_message(Packet *pkt, char* msg, char* filename_received){
     msg_traversal_ptr += colon_positions[3] - colon_positions[2];
     strcpy(filename_received, placeholder);
     
-    //no placeholder needed for payload
+    // No placeholder needed for payload (dump binary data straight in)
     memcpy(pkt->filedata, msg_traversal_ptr, pkt->size);
 
     return 0;
 }
+
